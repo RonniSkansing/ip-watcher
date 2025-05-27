@@ -19,6 +19,7 @@ type Config struct {
 	LogFile         string // Path to log file
 	IPEndpoint      string // Endpoint to check IP from
 	QuietMode       bool   // If true, only logs to file and not stdout
+	MaxRetries      int    // Maximum number of retry attempts for IP fetching
 	LastKnownIP     string // Cache the last known IP
 	LastKnownIPLock sync.Mutex
 }
@@ -46,6 +47,7 @@ func parseFlags() *Config {
 	flag.StringVar(&config.LogFile, "log", "", "Log file path (if not specified, logs to stdout only)")
 	flag.StringVar(&config.IPEndpoint, "endpoint", "https://api64.ipify.org?format=json", "URL of the IP checking service")
 	flag.BoolVar(&config.QuietMode, "quiet", false, "If true, only logs to file and not stdout")
+	flag.IntVar(&config.MaxRetries, "max-retries", 5, "Maximum number of retry attempts when fetching external IP")
 
 	// Parse flags
 	flag.Parse()
@@ -101,7 +103,7 @@ func startIPChecker(config *Config) {
 // checkIP performs a single IP check
 func checkIP(config *Config) {
 	// Make HTTP request to get IP
-	ip, err := fetchExternalIP(config.IPEndpoint)
+	ip, err := fetchExternalIP(config.IPEndpoint, 1, config.MaxRetries)
 	if err != nil {
 		logMessage("Error checking IP: %v", err)
 		return
@@ -127,31 +129,50 @@ type IPifyResponse struct {
 }
 
 // fetchExternalIP makes an HTTP request to the specified endpoint and extracts the IP
-func fetchExternalIP(endpoint string) (string, error) {
+// It will retry up to maxAttempts times if the request fails
+func fetchExternalIP(endpoint string, attempt int, maxAttempts int) (string, error) {
 	// Create HTTP client with a timeout
 	client := http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 5 * time.Second,
 	}
-
+	
+	// If we've already reached max attempts, fail immediately
+	if attempt > maxAttempts {
+		return "", fmt.Errorf("failed to make request after %d attempts", maxAttempts)
+	}
+	
 	// Make request
 	resp, err := client.Get(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("failed to make request: %v", err)
+		// If we haven't reached max attempts yet, try again
+		if attempt < maxAttempts {
+			return fetchExternalIP(endpoint, attempt+1, maxAttempts)
+		}
+		return "", fmt.Errorf("failed to make request after %d attempts: %v", maxAttempts, err)
 	}
 	defer resp.Body.Close()
-
+	
+	// Check status code - only proceed with 2xx responses
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// If we haven't reached max attempts yet, try again
+		if attempt < maxAttempts {
+			return fetchExternalIP(endpoint, attempt+1, maxAttempts)
+		}
+		return "", fmt.Errorf("failed after %d attempts: HTTP status %d", maxAttempts, resp.StatusCode)
+	}
+	
 	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %v", err)
 	}
-
+	
 	// Try to parse as JSON format (e.g., from ipify)
 	var ipResponse IPifyResponse
 	if err := json.Unmarshal(body, &ipResponse); err == nil && ipResponse.IP != "" {
 		return ipResponse.IP, nil
 	}
-
+	
 	// If JSON parsing fails, assume response is plain text
 	return string(body), nil
 }
